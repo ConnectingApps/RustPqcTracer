@@ -28,9 +28,6 @@ jobs:
       run: cargo publish --dry-run
       working-directory: pqctracer
 
-    - name: Install pqctracer
-      run: cargo install --path pqctracer
-
     - name: Build application
       run: cargo build --verbose
 
