@@ -5,17 +5,27 @@ use rustls::client::{Tls12ClientSessionValue, Tls13ClientSessionValue};
 use rustls::NamedGroup;
 use rustls_pki_types::ServerName;
 
-/// Shared TLS metadata captured during the handshake.
+/// TLS metadata captured during a single request's handshake.
+pub struct TlsResponse {
+    pub response: reqwest::Response,
+    pub group: Option<String>,
+    pub cipher: Option<String>,
+}
+
+/// Per-request TLS metadata populated by the session store callbacks.
 #[derive(Default, Debug)]
 struct Captured {
     group: Option<String>,
     cipher: Option<String>,
 }
 
-/// A `ClientSessionStore` that intercepts post-handshake callbacks to record
-/// the negotiated KX group (`set_kx_hint`) and cipher suite (`insert_tls13_ticket`).
+/// A `ClientSessionStore` that routes TLS handshake callbacks into whatever
+/// per-request `Captured` is currently active.
+///
+/// The shared `active` pointer is set just before a request is sent and
+/// cleared immediately after – always outside any `.await` point.
 struct CapturingSessionStore {
-    state: Arc<Mutex<Captured>>,
+    active: Arc<Mutex<Option<Arc<Mutex<Captured>>>>>,
 }
 
 impl fmt::Debug for CapturingSessionStore {
@@ -27,7 +37,10 @@ impl fmt::Debug for CapturingSessionStore {
 impl ClientSessionStore for CapturingSessionStore {
     // Called after every successful handshake with the group that was used.
     fn set_kx_hint(&self, _server_name: ServerName<'static>, group: NamedGroup) {
-        self.state.lock().unwrap().group = Some(format!("{:?}", group));
+        let slot = self.active.lock().unwrap().clone();
+        if let Some(captured) = slot {
+            captured.lock().unwrap().group = Some(format!("{:?}", group));
+        }
     }
 
     fn kx_hint(&self, _server_name: &ServerName<'_>) -> Option<NamedGroup> {
@@ -45,9 +58,12 @@ impl ClientSessionStore for CapturingSessionStore {
 
     // TLS 1.3 ticket – record cipher suite from the session value.
     fn insert_tls13_ticket(&self, _server_name: ServerName<'static>, value: Tls13ClientSessionValue) {
-        let mut s = self.state.lock().unwrap();
-        if s.cipher.is_none() {
-            s.cipher = Some(format!("{:?}", value.suite().common.suite));
+        let slot = self.active.lock().unwrap().clone();
+        if let Some(captured) = slot {
+            let mut c = captured.lock().unwrap();
+            if c.cipher.is_none() {
+                c.cipher = Some(format!("{:?}", value.suite().common.suite));
+            }
         }
     }
 
@@ -56,48 +72,75 @@ impl ClientSessionStore for CapturingSessionStore {
     }
 }
 
-async fn execute_with_tls_info(
-    request: reqwest::Request,
-) -> Result<
-    (
-        reqwest::Response,
-        Option<String>,
-        Option<String>,
-    ),
-    reqwest::Error,
-> {
-    // Shared state populated during the TLS handshake.
-    let captured = Arc::new(Mutex::new(Captured::default()));
+/// A reusable HTTP client that captures TLS handshake metadata for every request.
+///
+/// Owns a single shared `reqwest::Client` (with connection pooling) and a single
+/// rustls configuration built once at construction time. Per-request capture
+/// context is installed and removed around each `.await` – no lock is ever held
+/// across an await point.
+pub struct TlsAwareClient {
+    client: reqwest::Client,
+    active_capture: Arc<Mutex<Option<Arc<Mutex<Captured>>>>>,
+}
 
-    let session_store = Arc::new(CapturingSessionStore {
-        state: captured.clone(),
-    });
+impl TlsAwareClient {
+    /// Build the client, configuring rustls once.
+    pub fn new() -> Self {
+        let active_capture: Arc<Mutex<Option<Arc<Mutex<Captured>>>>> =
+            Arc::new(Mutex::new(None));
 
-    // Build a rustls ClientConfig that uses our capturing session store.
-    let mut root_store = rustls::RootCertStore::empty();
-    root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
+        let session_store = Arc::new(CapturingSessionStore {
+            active: active_capture.clone(),
+        });
 
-    let mut tls_config = rustls::ClientConfig::builder()
-        .with_root_certificates(root_store)
-        .with_no_client_auth();
+        let mut root_store = rustls::RootCertStore::empty();
+        root_store.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
 
-    // Attach our capturing store via the public `resumption` field.
-    tls_config.resumption = Resumption::store(session_store);
+        let mut tls_config = rustls::ClientConfig::builder()
+            .with_root_certificates(root_store)
+            .with_no_client_auth();
 
-    // Hand the pre-built rustls config to reqwest – one single async HTTP request.
-    let client = reqwest::Client::builder()
-        .use_preconfigured_tls(tls_config)
-        .build()
-        .expect("failed to build client");
+        tls_config.resumption = Resumption::store(session_store);
 
-    let response = client.execute(request).await?;
+        let client = reqwest::Client::builder()
+            .use_preconfigured_tls(tls_config)
+            .build()
+            .expect("failed to build reqwest client");
 
-    // Read the captured TLS metadata.
-    let state = captured.lock().unwrap();
-    let group = state.group.clone();
-    let cipher = state.cipher.clone();
+        Self { client, active_capture }
+    }
 
-    Ok((response, group, cipher))
+    /// Execute any `reqwest::Request` and return the response together with
+    /// the negotiated TLS key-exchange group and cipher suite.
+    ///
+    /// Accepts GET / POST / PUT / PATCH / DELETE / … without special handling.
+    pub async fn execute(&self, request: reqwest::Request) -> Result<TlsResponse, reqwest::Error> {
+        // 1. Create a fresh capture context for this request.
+        let captured = Arc::new(Mutex::new(Captured::default()));
+
+        // 2. Activate it (lock scope ends before .await).
+        {
+            let mut active = self.active_capture.lock().unwrap();
+            *active = Some(captured.clone());
+        }
+
+        // 3. Send the request through the shared, pooled client.
+        let response = self.client.execute(request).await?;
+
+        // 4. Deactivate capture (lock scope ends immediately).
+        {
+            let mut active = self.active_capture.lock().unwrap();
+            *active = None;
+        }
+
+        // 5. Read captured values.
+        let state = captured.lock().unwrap();
+        Ok(TlsResponse {
+            response,
+            group: state.group.clone(),
+            cipher: state.cipher.clone(),
+        })
+    }
 }
 
 #[tokio::main]
@@ -112,19 +155,21 @@ async fn main() {
     let url = format!("https://{}", host);
     println!("Requesting: {}", url);
 
-    let client = reqwest::Client::new();
-    let req = client
+    // Build the reusable TLS-aware client once.
+    let tls_client = TlsAwareClient::new();
+
+    // Build a plain reqwest::Request (GET, but any method works).
+    let req = reqwest::Client::new()
         .get(&url)
         .build()
         .expect("failed to build request");
 
-    let (resp, group, cipher) =
-        execute_with_tls_info(req).await.expect("request failed");
+    let result = tls_client.execute(req).await.expect("request failed");
 
-    let group = group.as_deref().unwrap_or("Not available");
-    let cipher = cipher.as_deref().unwrap_or("Not available");
+    let group = result.group.as_deref().unwrap_or("Not available");
+    let cipher = result.cipher.as_deref().unwrap_or("Not available");
 
-    println!("Status code: {}", resp.status());
+    println!("Status code: {}", result.response.status());
     println!("Negotiated group: {}", group);
     println!("Cipher suite: {}", cipher);
 }
