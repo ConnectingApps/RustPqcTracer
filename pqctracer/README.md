@@ -76,7 +76,7 @@ The output above illustrates that PQC usage depends on **both** the client and t
 
 ## Author
 
-Created by [Daan Cohen](https://www.linkedin.com/in/daanacohen). Feel free to reach out via LinkedIn if you need help or have questions about this package.
+Created by [Daan Acohen](https://www.linkedin.com/in/daanacohen). Feel free to reach out via LinkedIn if you need help or have questions about this package.
 
 ## License
 
