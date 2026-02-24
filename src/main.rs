@@ -56,18 +56,16 @@ impl ClientSessionStore for CapturingSessionStore {
     }
 }
 
-#[tokio::main]
-async fn main() {
-    // Install aws-lc-rs as the process-level crypto provider (required when
-    // `prefer-post-quantum` is enabled, since it brings in aws-lc-rs alongside ring).
-    rustls::crypto::aws_lc_rs::default_provider()
-        .install_default()
-        .expect("failed to install crypto provider");
-
-    let host = "www.google.com";
-    let url = format!("https://{}", host);
-    println!("Requesting: {}", url);
-
+async fn execute_with_tls_info(
+    request: reqwest::Request,
+) -> Result<
+    (
+        reqwest::Response,
+        Option<String>,
+        Option<String>,
+    ),
+    reqwest::Error,
+> {
     // Shared state populated during the TLS handshake.
     let captured = Arc::new(Mutex::new(Captured::default()));
 
@@ -92,20 +90,41 @@ async fn main() {
         .build()
         .expect("failed to build client");
 
-    let response = client
-        .get(&url)
-        .send()
-        .await
-        .expect("request failed");
-
-    let status = response.status();
+    let response = client.execute(request).await?;
 
     // Read the captured TLS metadata.
     let state = captured.lock().unwrap();
-    let group = state.group.as_deref().unwrap_or("Not available");
-    let cipher = state.cipher.as_deref().unwrap_or("Not available");
+    let group = state.group.clone();
+    let cipher = state.cipher.clone();
 
-    println!("Status code: {}", status);
+    Ok((response, group, cipher))
+}
+
+#[tokio::main]
+async fn main() {
+    // Install aws-lc-rs as the process-level crypto provider (required when
+    // `prefer-post-quantum` is enabled, since it brings in aws-lc-rs alongside ring).
+    rustls::crypto::aws_lc_rs::default_provider()
+        .install_default()
+        .expect("failed to install crypto provider");
+
+    let host = "www.google.com";
+    let url = format!("https://{}", host);
+    println!("Requesting: {}", url);
+
+    let client = reqwest::Client::new();
+    let req = client
+        .get(&url)
+        .build()
+        .expect("failed to build request");
+
+    let (resp, group, cipher) =
+        execute_with_tls_info(req).await.expect("request failed");
+
+    let group = group.as_deref().unwrap_or("Not available");
+    let cipher = cipher.as_deref().unwrap_or("Not available");
+
+    println!("Status code: {}", resp.status());
     println!("Negotiated group: {}", group);
     println!("Cipher suite: {}", cipher);
 }
