@@ -518,7 +518,6 @@ dependencies = [
  "reqwest",
  "rustls",
  "rustls-pki-types",
- "tokio",
  "webpki-roots",
 ]
 
